@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using JetBrains.Annotations;
@@ -9,14 +8,14 @@ using UnityEngine.Rendering;
 using Debug = UnityEngine.Debug;
 using Random = UnityEngine.Random;
 
-public class GrimmCannonWindow : EditorWindow
+public class ClutterBrushWindow : EditorWindow
 {
 	const float TAU = Mathf.PI * 2;
 
-	[MenuItem("Tools/Grimm Cannon")]
+	[MenuItem("Tools/Clutter Brush")]
 	public static void OpenWindow()
 	{
-		GetWindow<GrimmCannonWindow>("Grimm Cannon");
+		GetWindow<ClutterBrushWindow>("Clutter Brush");
 	}
 
 	public bool ShowBrush = true;
@@ -721,7 +720,7 @@ public class GrimmCannonWindow : EditorWindow
 
 		if (prefabsProperty.arraySize == 0)
 		{
-			EditorGUILayout.LabelField("No elements in set.", ToolGui.Warning, GUILayout.ExpandWidth(true));
+			EditorGUILayout.LabelField("No elements in set.", ToolGuiStyles.Warning, GUILayout.ExpandWidth(true));
 		}
 		else
 		{
@@ -890,24 +889,5 @@ public class GrimmCannonWindow : EditorWindow
 
 			return isPressed;
 		}
-	}
-}
-
-public static class ToolGui
-{
-	public static GUIStyle Warning = CreateStyle(GUI.skin.label, TextAnchor.MiddleCenter, Color.red);
-
-	private static GUIStyle CreateStyle(GUIStyle baseStyle = null, TextAnchor alignment = TextAnchor.MiddleLeft, Color? foregroundColor = null)
-	{
-		GUIStyle style = baseStyle == null ? new GUIStyle() : new GUIStyle(GUI.skin.label);
-		
-		style.alignment = alignment;
-
-		if (foregroundColor.HasValue)
-		{
-			style.normal.textColor = foregroundColor.Value;
-		}
-
-		return style;
 	}
 }
