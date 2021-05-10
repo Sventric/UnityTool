@@ -1,9 +1,8 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
-using System.Runtime.InteropServices;
-using NUnit.Framework;
+using JetBrains.Annotations;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -23,11 +22,26 @@ public class GrimmCannonWindow : EditorWindow
 	public bool ShowBrush = true;
 	public float Radius = 2f;
 	public int SpawnCount = 8;
+	public LayerMask SurfaceLayers;
+	public GameObject Container;
+
+	[SerializeField]
+	private List<PrefabSet> _sets;
+	[SerializeField]
+	private int _selectedSetIndex;
+	[SerializeField]
+	private bool _openEditSet;
 
 	private SerializedObject _serializedObject;
 	private SerializedProperty _serializedShowBrush;
 	private SerializedProperty _serializedRadius;
 	private SerializedProperty _serializedSpawnCount;
+	private SerializedProperty _serializedSurfaceLayers;
+	private SerializedProperty _serializedContainer;
+
+	private SerializedProperty _serializedPrefabSets;
+	private SerializedProperty _serializedSelectedSetIndex;
+	private SerializedProperty _serializedOpenEditSet;
 
 	private void SetupSerialization()
 	{
@@ -35,47 +49,76 @@ public class GrimmCannonWindow : EditorWindow
 		_serializedShowBrush = _serializedObject.FindProperty(nameof(ShowBrush));
 		_serializedRadius = _serializedObject.FindProperty(nameof(Radius));
 		_serializedSpawnCount = _serializedObject.FindProperty(nameof(SpawnCount));
+		_serializedSurfaceLayers = _serializedObject.FindProperty(nameof(SurfaceLayers));
+		_serializedContainer = _serializedObject.FindProperty(nameof(Container));
+
+		_serializedPrefabSets = _serializedObject.FindProperty(nameof(_sets));
+		_serializedSelectedSetIndex = _serializedObject.FindProperty(nameof(_selectedSetIndex));
+		_serializedOpenEditSet = _serializedObject.FindProperty(nameof(_openEditSet));
 	}
 
-	private Vector2[] _randomPoints = new Vector2[0];
+	private PlacementLocation[] _randomLocations = new PlacementLocation[0];
 
-	private void GenerateRandomPoints(int count, bool refresh)
+	private IEnumerable<PlacementLocation> RandomLocations
 	{
-		if (!refresh && count <= _randomPoints.Length)
+		get { return _randomLocations.Take(SpawnCount); }
+	}
+
+	private class PlacementLocation
+	{
+		public Vector2 UnitLocation;
+		public int PrefabIndex;
+		public Vector3 WorldPosition;
+		public Vector3 Normal;
+		public bool HitSurface;
+		public Quaternion Rotation;
+		public Quaternion Orientation;
+	}
+
+	private void GenerateRandomLocations(int count, bool refresh)
+	{
+		if (!refresh && count <= _randomLocations.Length)
 		{
 			//Debug.Log($"Skip resize random points [{_randomPoints.Length} / {count}].");
 			return;
 		}
 
 		//Debug.Log($"Create new set [{refresh}].");
-		Vector2[] newSet = new Vector2[count];
+		PlacementLocation[] newSet = new PlacementLocation[count];
 
 		for (int idx = 0; idx < count; idx++)
 		{
-			if (refresh || idx >= _randomPoints.Length)
+			if (refresh || idx >= _randomLocations.Length)
 			{
 				//Debug.Log($"Add new index: {idx}.");
-				newSet[idx] = Random.insideUnitCircle;
+				newSet[idx] = new PlacementLocation
+				{
+					UnitLocation = Random.insideUnitCircle,
+					PrefabIndex = GetRandomPrefabIndex(),
+					Orientation = Quaternion.Euler(0, Random.value * 360, 0)
+				};
 			}
 			else
 			{
 				//Debug.Log($"Copy old index: {idx}.");
-				newSet[idx] = _randomPoints[idx];
+				newSet[idx] = _randomLocations[idx];
 			}
 		}
 
 		//Debug.Log("Apply new set.");
-		_randomPoints = newSet;
+		_randomLocations = newSet;
 	}
 
+	[UsedImplicitly /* Unity method */]
 	private void OnEnable()
 	{
 		SetupSerialization();
-		GenerateRandomPoints(SpawnCount, true);
+		GenerateRandomLocations(SpawnCount, true);
 
 		SceneView.duringSceneGui += DuringSceneGUI;
 	}
 
+	[UsedImplicitly /* Unity method */]
 	private void OnDisable()
 	{
 		SceneView.duringSceneGui -= DuringSceneGUI;
@@ -97,6 +140,9 @@ public class GrimmCannonWindow : EditorWindow
 		}
 	}
 
+	private TangentSpace _lastHitTangentSpace;
+	private float _rayElevationHeight = 5f;
+
 	private void ScatterPlacer(SceneView sceneView)
 	{
 		if (!ShowBrush)
@@ -104,307 +150,460 @@ public class GrimmCannonWindow : EditorWindow
 			return;
 		}
 
+		if (UpdateSceneView(sceneView))
+		{
+			return;
+		}
+
+		if (UpdateRadius())
+		{
+			return;
+		}
+
+		//TryPlaceObjects();
+		if (PlaceObjects())
+		{
+			return;
+		}
+
+		if (DetermineLayout(sceneView))
+		{
+			return;
+		}
+
+		UpdateSceneUI();
+	}
+
+	private PrefabSet ActiveSet
+	{
+		get
+		{
+			if (_sets == null || _selectedSetIndex >= _sets.Count)
+			{
+				return null;
+			}
+
+			return _sets[_selectedSetIndex];
+		}
+	}
+
+	private GameObject GetActivePrefab(int index)
+	{
+		PrefabSet set = ActiveSet;
+
+		if (index < 0 || set?.Prefabs == null || index >= set.Prefabs.Count)
+		{
+			return null;
+		}
+
+		return set.Prefabs[index].Prefab;
+	}
+
+	private void UpdateSceneUI()
+	{
+		if (Event.current.type != EventType.Repaint || _lastHitTangentSpace == null)
+		{
+			return;
+		}
+
 		Handles.zTest = CompareFunction.LessEqual;
 
-		Transform cameraTransform = sceneView.camera.transform;
+		// Draw the current situation.
+		_lastHitTangentSpace.DrawHandles();
 
-		if (Event.current.type == EventType.MouseMove)
+		// The tangent plane.
+		// Handles.color = new Color(0, 0, 0, .5f);
+		// Handles.DrawSolidDisc(hit.point + hit.normal * .01f, hit.normal, Radius);
+		// The ray plane.
+		// Handles.color = new Color(0, 0, 0, .5f);
+		// Handles.DrawSolidDisc(hit.point + _rayElevationHeight * hit.normal, hit.normal, Radius);
+
+		DrawBrush(Color.blue, 6f, 256);
+
+		foreach (PlacementLocation location in RandomLocations.Where(rl => rl.HitSurface))
 		{
-			// Repaint on mouse move.
-			sceneView.Repaint();
+			// Skip when normal too much off.
+			float angle = Vector3.Angle(_lastHitTangentSpace.Up, location.Normal);
+			float thresholdAngle = 30;
+			GameObject activePrefab = GetActivePrefab(location.PrefabIndex);
+
+			if (activePrefab == null)
+			{
+				Color handleColor = GetAngleColor(angle, thresholdAngle);
+				// Draw a dot where a placement will occur.
+				Handles.color = handleColor;
+				Handles.SphereHandleCap(-1, location.WorldPosition, Quaternion.identity, .1f, EventType.Repaint);
+				// Draw the local normal
+				Handles.color = Color.black;
+				Handles.DrawAAPolyLine(5f, location.WorldPosition, location.WorldPosition + location.Normal);
+			}
+			else
+			{
+				if (angle > thresholdAngle)
+				{
+					continue;
+				}
+
+				RenderModelAtLocation(activePrefab, location);
+			}
+		}
+	}
+
+	private void RenderModelAtLocation(GameObject activePrefab, PlacementLocation location)
+	{
+		Matrix4x4 rootOrientationMatrix = Matrix4x4.TRS(location.WorldPosition, location.Rotation, Vector3.one); //, activePrefab.transform.localScale);
+		MeshFilter[] filters = activePrefab.GetComponentsInChildren<MeshFilter>();
+
+		foreach (MeshFilter filter in filters)
+		{
+			Matrix4x4 localOrientation = filter.transform.localToWorldMatrix;
+			Matrix4x4 worldOrientation = rootOrientationMatrix * localOrientation;
+
+			MeshRenderer renderer = filter.GetComponent<MeshRenderer>();
+			Material material = renderer.sharedMaterial;
+			material.SetPass(0);
+
+			Mesh mesh = filter.sharedMesh;
+			Graphics.DrawMeshNow(mesh, worldOrientation);
 		}
 
-		// bool hasAlt = (Event.current.modifiers & EventModifiers.Alt) != 0
 
-		if (Event.current.type == EventType.ScrollWheel && !Event.current.alt)
+		//Material material = activePrefab.GetComponent<MeshRenderer>().sharedMaterial;
+		//material.SetPass(0);
+		//
+		//Mesh mesh = activePrefab.GetComponent<MeshFilter>().sharedMesh;
+		//Graphics.DrawMeshNow(mesh, rootOrientationMatrix);
+	}
+
+	private bool _isPlacing = false;
+	private Vector2 _lastPlacementPosition;
+
+	private bool TryPlaceObjects()
+	{
+		bool result = false;
+		bool allowPlacement = false;
+
+		if (Event.current.type == EventType.MouseDown && Event.current.button == 0)
 		{
-			// How far did the mouse wheel moved.
-			float scrollDirection = Event.current.delta.y; // +3 / -3
-			// Debug.Log($"ScrollWheel: {scrollDirection}");
+			_isPlacing = true;
+			result = true;
+			allowPlacement = true;
+			_lastPlacementPosition = Event.current.mousePosition;
+			Debug.Log($"Start placement: {_lastPlacementPosition}.");
+		}
+		else if (Event.current.type == EventType.MouseUp && _isPlacing)
+		{
+			_isPlacing = false;
+			allowPlacement = true;
+			result = true;
+			Debug.Log($"Stopping placement: {Event.current.mousePosition}");
+		}
+		else if (Event.current.type == EventType.MouseDrag && _isPlacing)
+		{
+			result = true;
+			float distance = (Event.current.mousePosition - _lastPlacementPosition).magnitude;
+			Debug.Log($"Drag: {distance}");
+		}
 
-			_serializedObject.Update();
-			_serializedRadius.floatValue *= 1 + -Mathf.Sign(scrollDirection) * .05f;
+		if (_isPlacing && allowPlacement)
+		{
+		}
 
-			if (_serializedObject.ApplyModifiedProperties())
-			{
-				Repaint();
-			}
-
-			// PreventPropagate
+		if (result)
+		{
 			Event.current.Use();
 		}
 
-		bool addPrefabs = Event.current.type == EventType.KeyUp && Event.current.keyCode == KeyCode.Space;
+		return result;
+	}
 
-		if (addPrefabs)
+	private bool PlaceObjects()
+	{
+		if (Event.current.type != EventType.KeyDown)
 		{
-			Debug.Log("Clicked... let's add.");
-			// PreventPropagate
-			Event.current.Use();
+			return false;
 		}
 
-		Ray ray = HandleUtility.GUIPointToWorldRay(Event.current.mousePosition);
-		//Ray ray = new Ray(cameraTransform.position, cameraTransform.forward);
+		Event.current.Use();
 
-		if (Physics.Raycast(ray, out RaycastHit hit))
+		if (_lastHitTangentSpace == null)
 		{
-			//Handles.color = Color.magenta;
-			//Handles.DrawAAPolyLine(5f, hit.point, hit.point + hit.normal);
-			Handles.color = new Color(0, 0, 0, .5f);
-			Handles.DrawSolidDisc(hit.point + hit.normal * .01f, hit.normal, Radius);
-
-			// Determine local tangent space
-			Vector3 hitNormal = hit.normal;
-			Vector3 hitTangent = Vector3.Cross(hitNormal, cameraTransform.up).normalized;
-			Vector3 hitBitangent = Vector3.Cross(hitNormal, hitTangent)/*.normalized Not needed.*/;
-			float topViewHeight = 5f;
-
-			Ray GetTangentRay(Vector2 tangentSpacePosition)
-			{
-				Vector2 localPoint = tangentSpacePosition * Radius;
-				Vector3 rayOrigin = hit.point + hitNormal * topViewHeight
-				                              + hitTangent * localPoint.x
-				                              + hitBitangent * localPoint.y;
-				Vector3 radDirection = -hitNormal;
-				return new Ray(rayOrigin, radDirection);
-			}
-
-			Handles.color = new Color(0, 0, 0, .5f);
-			Handles.DrawSolidDisc(hit.point + topViewHeight * hit.normal, hit.normal, Radius);
-			//DrawCircle(hit, Radius, Color.blue, 5f);
-			Color baseColor = Color.yellow;
-			Color tooSteep = Color.red;
-
-			foreach (Vector2 point in _randomPoints.Take(SpawnCount))
-			{
-				/*
-				Vector2 localPoint = point * Radius;
-				Vector3 rayOrigin = hit.point + hitNormal * topViewHeight
-				                        + hitTangent * localPoint.x
-				                        + hitBitangent * localPoint.y;
-				Vector3 radDirection = -hitNormal;
-				//*/
-
-				Ray placementRay = GetTangentRay(point);
-
-				if (Physics.Raycast(placementRay, out RaycastHit placementHit))
-				{
-					// Skip when normal too much off.
-					float angle = Vector3.Angle(hitNormal, placementHit.normal);
-					Handles.color = Color.Lerp(baseColor, tooSteep, angle / 90);
-
-					//Handles.color = new Color(1f, 1f, 0, .5f);
-					Handles.SphereHandleCap(-1, placementHit.point, Quaternion.identity, .1f, EventType.Repaint);
-					Handles.color = Color.black;
-					Handles.DrawAAPolyLine(5f, placementHit.point, placementHit.point + placementHit.normal);
-
-					if (angle > 30f)
-					{
-						// TOO Steep
-						continue;
-					}
-
-					if (addPrefabs)
-					{
-						GameObject prefab = GetPrefab();
-						prefab.name += $" ∠{angle}";
-						//GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
-						prefab.transform.position = placementHit.point;
-						prefab.transform.up = placementHit.normal;
-						prefab.transform.localRotation = Quaternion.Euler(new Vector3(0, Random.Range(0f, 360f), 0));
-						// For tree, but not rocks:
-						//   float size = 1 + Random.Range(-.1f, +.1f);
-						//   float height = 1 + Random.Range(-.1f, +.1f);
-						//   prefab.transform.localScale = new Vector3(size, height, size);
-					}
-				}
-			}
-
-			Handles.color = Handles.xAxisColor;
-			Handles.DrawAAPolyLine(5f, hit.point, hit.point + hitTangent);
-
-			Handles.color = Handles.zAxisColor;
-			Handles.DrawAAPolyLine(5f, hit.point, hit.point + hitBitangent);
-
-			Handles.color = Handles.yAxisColor;
-			Handles.DrawAAPolyLine(5f, hit.point, hit.point + hitNormal);
-
-			// Draw circle
-			Handles.color = Color.blue;
-			const int segmentCount = 256;
-			Vector3[] circlePoints = new Vector3[segmentCount + 1];
-			for (int i = 0; i < segmentCount; i++)
-			{
-				float t = i / (float)segmentCount;
-				float radiusAngle = t * TAU;
-				Vector2 direction = new Vector2(Mathf.Cos(radiusAngle), Mathf.Sin(radiusAngle));
-				Ray circleRay = GetTangentRay(direction);
-
-				if (Physics.Raycast(circleRay, out RaycastHit circleHit))
-				{
-					circlePoints[i] = circleHit.point + circleHit.normal * .01f;
-				}
-				else
-				{
-					Vector2 localPoint = direction * Radius;
-					Vector3 circlePoint = hit.point
-					                              + hitTangent * localPoint.x
-					                              + hitBitangent * localPoint.y;
-					circlePoints[i] = circlePoint;
-				}
-			}
-			// Map the end to the beginning.
-			circlePoints[segmentCount] = circlePoints[0];
-			Handles.DrawAAPolyLine(6f, circlePoints);
+			// No location to place something.
+			// But it's handled.
+			return true;
 		}
-		else
+
+		if (Event.current.keyCode != KeyCode.Space)
 		{
-			// We are not above any surface.
-
-			//Handles.color = Color.cyan;
-			//float halfDistance = (cameraTransform.position / 2).magnitude;
-			//Vector3 center = cameraTransform.position + cameraTransform.forward * halfDistance;
-			//Handles.DrawSolidDisc(center, cameraTransform.forward * -1, 2);
+			// Currently only space is used, ignore the reset...
+			// But it's handled.
+			return true;
 		}
+
+		foreach (PlacementLocation location in RandomLocations.Where(rl => rl.HitSurface))
+		{
+			// Skip when normal too much off.
+			float angle = Vector3.Angle(_lastHitTangentSpace.Up, location.Normal);
+			float thresholdAngle = 45;
+
+			if (angle > thresholdAngle)
+			{
+				// TOO Steep
+				continue;
+			}
+
+			GameObject prefab = GetPrefab();
+			Undo.RegisterCreatedObjectUndo(prefab, "Spawn Objects");
+			prefab.name += $" ∠{angle}";
+			prefab.transform.position = location.WorldPosition;
+			prefab.transform.rotation = location.Rotation;
+
+			if (Container)
+			{
+				prefab.transform.SetParent(Container.transform, true);
+			}
+		}
+
+		GenerateRandomLocations(SpawnCount, true);
+
+		return true;
+	}
+
+	private int GetRandomPrefabIndex()
+	{
+		PrefabSet set = ActiveSet;
+
+		if (set?.Prefabs == null || set.Prefabs.Count == 0)
+		{
+			return -1;
+		}
+
+		IList<PrefabEntry> activePrefabSet = set.Prefabs;
+		float selectionValue = Random.value;
+
+		for (int index = 0; index < activePrefabSet.Count; index++)
+		{
+			PrefabEntry entry = activePrefabSet[index];
+
+			if (entry.OccurrenceFactor > selectionValue)
+			{
+				return index;
+			}
+
+			selectionValue -= entry.OccurrenceFactor;
+		}
+
+		return activePrefabSet.Count - 1;
 	}
 
 	private GameObject GetPrefab()
 	{
 		float selectionValue = Random.value;
 
-		foreach (PrefabEntry entry in Sets[_selectedSetIndex].Prefabs)
+		foreach (PrefabEntry entry in _sets[_selectedSetIndex].Prefabs)
 		{
 			if (entry.OccurrenceFactor > selectionValue)
 			{
-				return Instantiate(entry.Prefab);
+				return (GameObject)PrefabUtility.InstantiatePrefab(entry.Prefab);
 			}
 
 			selectionValue -= entry.OccurrenceFactor;
 		}
 
-		return Instantiate(Sets[_selectedSetIndex].Prefabs.Last().Prefab);
+		return (GameObject)PrefabUtility.InstantiatePrefab(_sets[_selectedSetIndex].Prefabs.Last().Prefab);
 	}
 
-	private void SimpleScatterPlacer(SceneView sceneView)
+	private bool DetermineLayout(SceneView sceneView)
 	{
-		Transform cameraTransform = sceneView.camera.transform;
-
-		Ray ray = new Ray(cameraTransform.position, cameraTransform.forward);
-		Handles.zTest = CompareFunction.LessEqual;
-
-		if (Physics.Raycast(ray, out RaycastHit hit))
+		if (Event.current.type != EventType.Layout)
 		{
-			//Handles.color = Color.magenta;
-			//Handles.DrawAAPolyLine(5f, hit.point, hit.point + hit.normal);
-			Handles.color = new Color(0, 0, 0, .5f);
-			Handles.DrawSolidDisc(hit.point, hit.normal, Radius);
+			return false;
+		}
 
-			// Determine local tangent space
-			Vector3 hitNormal = hit.normal;
-			Vector3 hitTangent = Vector3.Cross(hitNormal, cameraTransform.up).normalized;
-			Vector3 hitBitangent = Vector3.Cross(hitNormal, hitTangent)/*.normalized Not needed.*/;
+		Transform cameraTransform = sceneView.camera.transform;
+		Ray ray = HandleUtility.GUIPointToWorldRay(Event.current.mousePosition);
+		bool validSurface = false;
+		bool hitSurface = Physics.Raycast(ray, out RaycastHit hit);
 
-			float topViewHeight = 5f;
-			Handles.color = new Color(0, 0, 0, .5f);
-			Handles.DrawSolidDisc(hit.point + topViewHeight * hit.normal, hit.normal, Radius);
+		if (hitSurface)
+		{
+			GameObject surfaceObject = hit.transform.gameObject;
+			int surfaceLayer = surfaceObject.layer;
+			int surfaceMask = 1 << surfaceLayer;
+			validSurface = (SurfaceLayers.value & surfaceMask) == surfaceMask;
+		}
 
-			foreach (Vector2 point in _randomPoints.Take(SpawnCount))
-			{
-				Vector2 localPoint = point * Radius;
-				Vector3 rayOrigin = hit.point + hitNormal * topViewHeight
-				                        + hitTangent * localPoint.x
-				                        + hitBitangent * localPoint.y;
-				Vector3 radDirection = -hitNormal;
+		if(validSurface)
+		{
+			_lastHitTangentSpace = TangentSpace.CreateFromUp(hit.point, hit.normal, cameraTransform.up);
 
-				Ray placementRay = new Ray(rayOrigin, radDirection);
-
-				if (Physics.Raycast(placementRay, out RaycastHit placementHit))
-				{
-					Handles.color = new Color(1f, 1f, 0, .5f);
-					Handles.SphereHandleCap(-1, placementHit.point, Quaternion.identity, .1f, EventType.Repaint);
-					Handles.color = Color.black;
-					Handles.DrawAAPolyLine(5f, placementHit.point, placementHit.point + placementHit.normal);
-				}
-			}
-
-			Handles.color = Handles.xAxisColor;
-			Handles.DrawAAPolyLine(5f, hit.point, hit.point + hitTangent);
-
-			Handles.color = Handles.zAxisColor;
-			Handles.DrawAAPolyLine(5f, hit.point, hit.point + hitBitangent);
-
-			Handles.color = Handles.yAxisColor;
-			Handles.DrawAAPolyLine(5f, hit.point, hit.point + hitNormal);
+			UpdatePlacementLocations();
 		}
 		else
 		{
-			Handles.color = Color.cyan;
-			float halfDistance = (cameraTransform.position / 2).magnitude;
-			Vector3 center = cameraTransform.position + cameraTransform.forward * halfDistance;
-			Handles.DrawSolidDisc(center, cameraTransform.forward * -1, 2);
+			_lastHitTangentSpace = null;
+		}
+
+		return true;
+
+	}
+
+	private void UpdatePlacementLocations()
+	{
+		foreach (PlacementLocation location in RandomLocations.ToArray())
+		{
+			// Scale the point in the unit-circle to a circle of specified radius.
+			Vector2 localPoint = location.UnitLocation * Radius;
+			Ray placementRay = _lastHitTangentSpace.GetTangentRay(localPoint, _rayElevationHeight);
+			bool validSurface = false;
+			bool hitSurface = Physics.Raycast(placementRay, out RaycastHit placementHit);
+
+			if (hitSurface)
+			{
+				GameObject surfaceObject = placementHit.transform.gameObject;
+				int surfaceLayer = surfaceObject.layer;
+				int surfaceMask = 1 << surfaceLayer;
+				validSurface = (SurfaceLayers.value & surfaceMask) == surfaceMask;
+			}
+
+			if (validSurface)
+			{
+				// Align the object with the Normal vector of the local plane.
+				Quaternion rotation = Quaternion.FromToRotation(Vector3.up, location.Normal);
+				// Give it a random rotation around the Normal vector.
+				rotation *= location.Orientation; // Quaternion.Euler(0, Random.value * 360, 0);
+
+				location.HitSurface = true;
+				location.WorldPosition = placementHit.point;
+				location.Normal = placementHit.normal;
+				location.Rotation = rotation;
+			}
+			else
+			{
+				location.HitSurface = false;
+#if DEBUG
+				location.WorldPosition = Vector3.zero;
+				location.Normal = Vector3.zero;
+#endif
+			}
 		}
 	}
 
-	public List<PrefabSet> Sets;
-	public int _selectedSetIndex;
-	private bool _openEditSet;
+	private void DrawBrush(Color color, float width, int segmentCount)
+	{
+		if (_lastHitTangentSpace == null)
+		{
+			return;
+		}
+
+		// Draw circle
+		Handles.color = color;
+		Vector3[] circlePoints = new Vector3[segmentCount + 1];
+
+		for (int i = 0; i < segmentCount; i++)
+		{
+			float t = i / (float)segmentCount;
+			float radiusAngle = t * TAU;
+			Vector2 direction = new Vector2(Mathf.Cos(radiusAngle), Mathf.Sin(radiusAngle));
+			Vector2 location = direction * Radius;
+			Ray ray = _lastHitTangentSpace.GetTangentRay(location, _rayElevationHeight);
+
+			if (Physics.Raycast(ray, out RaycastHit hit, 50f, SurfaceLayers.value))
+			{
+				circlePoints[i] = hit.point + hit.normal * .01f;
+			}
+			else
+			{
+				Vector3 circlePoint = _lastHitTangentSpace.ConvertToWorldSpace(location);
+				circlePoints[i] = circlePoint;
+			}
+		}
+
+		// Map the end to the beginning.
+		circlePoints[segmentCount] = circlePoints[0];
+		Handles.DrawAAPolyLine(width, circlePoints);
+	}
+
+	private bool UpdateSceneView(SceneView sceneView)
+	{
+		if (Event.current.type != EventType.MouseMove)
+		{
+			return false;
+		}
+
+		// Repaint on mouse move.
+		sceneView.Repaint();
+		return true;
+	}
+
+	private bool UpdateRadius()
+	{
+		if (Event.current.type != EventType.ScrollWheel || Event.current.alt)
+		{
+			return false;
+		}
+
+		// How far did the mouse wheel moved.
+		float scrollDirection = Event.current.delta.y; // +3 / -3
+													   // Debug.Log($"ScrollWheel: {scrollDirection}");
+
+		_serializedObject.Update();
+		_serializedRadius.floatValue *= 1 + -Mathf.Sign(scrollDirection) * .05f;
+
+		if (_serializedObject.ApplyModifiedProperties())
+		{
+			Repaint();
+		}
+
+		// PreventPropagate
+		Event.current.Use();
+
+		return true;
+	}
+
+	private Color GetAngleColor(float angle, float thresholdAngle)
+	{
+		if (angle > thresholdAngle) return Color.red;
+
+		float safe = thresholdAngle / 3;
+		float edge = safe * 2;
+
+		if (angle <= safe)
+		{
+			return Color.green;
+		}
+
+		if (angle <= edge)
+		{
+			return Color.Lerp(Color.green, Color.yellow, (angle - safe) / safe);
+		}
+
+		return Color.Lerp(Color.yellow, Color.red, (angle - edge) / safe);
+	}
 
 	private void OnGUI()
 	{
 		_serializedObject.Update();
 
-		string[] options = Sets.Select(s => s.Name).ToArray();
-		_selectedSetIndex = EditorGUILayout.Popup("Brush set", _selectedSetIndex, options);
-		_openEditSet = EditorGUILayout.Foldout(_openEditSet, "Edit set");
 
-		if (_selectedSetIndex < options.Length && _openEditSet)
+		/*
+		 _serializedPrefabSets;
+		 _serializedSelectedSetIndex;
+		 _serializedOpenEditSet;
+		//*/
+		bool hasSelectedBrush = DrawBrushSetDropdown();
+
+		_serializedOpenEditSet.boolValue = EditorGUILayout.Foldout(_serializedOpenEditSet.boolValue, "Edit set");
+
+		if (hasSelectedBrush && _serializedOpenEditSet.boolValue)
 		{
-			using (new GUILayout.VerticalScope("Prefab set", EditorStyles.helpBox))
-			{
-				PrefabSet set = Sets[_selectedSetIndex];
-
-				EditorGUILayout.Space(8f);
-				set.Name = EditorGUILayout.TextField("Name", set.Name);
-
-				for (int index = 0; index < set.Prefabs.Count; index++)
-				{
-					PrefabEntry prefabEntry = set.Prefabs[index];
-					try
-					{
-						PrefabEntryGUI(prefabEntry);
-					}
-					catch (Exception exception)
-					{
-						Debug.LogError($"Failed rendering GUI for {set.Name}[{index}]");
-						Debug.LogException(exception, prefabEntry.Prefab);
-					}
-				}
-
-				/*
-
-				AddButton("Normalize occurrence factors", () => set.Prefabs.Count > 0, () =>
-				{
-					float totalFactor = set.Prefabs.Sum(p => p.OccurrenceFactor);
-					foreach (PrefabEntry entry in set.Prefabs)
-					{
-						entry.OccurrenceFactor /= totalFactor;
-					}
-				});
-
-				//*/
-
-				using (new EditorGUILayout.HorizontalScope())
-				{
-					AddButton("-", () => Debug.LogWarning($"Remove of prefab not implemented yet"));
-					AddButton("+", () => set.Prefabs.Add(new PrefabEntry()));
-				}
-			}
+			DrawBrushSetDetails();
 		}
 
 		using (new EditorGUILayout.HorizontalScope())
 		{
 			AddButton("Remove selected set.", () => Debug.LogWarning($"Remove of set not implemented yet"));
-			AddButton("Add new set", () => Sets.Add(new PrefabSet { Name = $"Unnamed {Sets.Count + 1}"}));
+			AddButton("Add new set", () => _sets.Add(new PrefabSet { Name = $"Unnamed {_sets.Count + 1}" }));
 		}
 
 		EditorGUILayout.PropertyField(_serializedShowBrush);
@@ -413,10 +612,12 @@ public class GrimmCannonWindow : EditorWindow
 		_serializedRadius.floatValue = Mathf.Max(0f, _serializedRadius.floatValue);
 		EditorGUILayout.PropertyField(_serializedSpawnCount);
 		_serializedSpawnCount.intValue = Mathf.Max(1, _serializedSpawnCount.intValue);
+		EditorGUILayout.PropertyField(_serializedSurfaceLayers);
+		EditorGUILayout.PropertyField(_serializedContainer);
 
 		if (_serializedObject.ApplyModifiedProperties())
 		{
-			GenerateRandomPoints(SpawnCount, false);
+			GenerateRandomLocations(SpawnCount, false);
 			SceneView.RepaintAll();
 		}
 
@@ -427,6 +628,193 @@ public class GrimmCannonWindow : EditorWindow
 			// Update window UI
 			Repaint();
 		}
+
+		if (Container)
+		{
+			AddButton("Reset", () =>
+			{
+				GameObject[] children = Container.GetAllChildren(t => t.gameObject).ToArray();
+				foreach (GameObject child in children)
+				{
+					DestroyImmediate(child);
+				}
+			});
+		}
+	}
+
+	private void DrawBrushSetDetails()
+	{
+		using (new GUILayout.VerticalScope("Prefab set", EditorStyles.helpBox))
+		{
+			// Prevent the first field to overlap the name of the scope.
+			EditorGUILayout.Space(8f);
+
+			SerializedProperty selectedSetProperty = _serializedPrefabSets.GetArrayElementAtIndex(_serializedSelectedSetIndex.intValue);
+			SerializedProperty nameProperty = selectedSetProperty.FindPropertyRelative(nameof(PrefabSet.Name));
+
+			EditorGUILayout.PropertyField(nameProperty);
+
+			if (nameProperty.stringValue == string.Empty)
+			{
+				nameProperty.stringValue = "Unnamed set";
+			}
+
+			// Normal correction
+			SerializedProperty normalCorrectionMinProperty = selectedSetProperty.FindPropertyRelative(nameof(PrefabSet.NormalCorrectionMin));
+			SerializedProperty normalCorrectionMaxProperty = selectedSetProperty.FindPropertyRelative(nameof(PrefabSet.NormalCorrectionMax));
+			float normalCorrectionMinFactor = normalCorrectionMinProperty.floatValue;
+			float normalCorrectionMaxFactor = normalCorrectionMaxProperty.floatValue;
+			EditorGUILayout.MinMaxSlider(new GUIContent("Normal correction", "A value of 1 will use the normal of the object and 0 will use the normal of the surface at the placement."), ref normalCorrectionMinFactor, ref normalCorrectionMaxFactor, 0, 1);
+			normalCorrectionMinProperty.floatValue = normalCorrectionMinFactor;
+			normalCorrectionMaxProperty.floatValue = normalCorrectionMaxFactor;
+
+			SerializedProperty easeMethodProperty = selectedSetProperty.FindPropertyRelative(nameof(PrefabSet.EaseMethod));
+			EditorGUILayout.PropertyField(easeMethodProperty);
+
+			SerializedProperty prefabsProperty = selectedSetProperty.FindPropertyRelative(nameof(PrefabSet.Prefabs));
+			DrawBrushElements(prefabsProperty);
+
+			// Disable old way
+			//PrefabSet set = _sets[_selectedSetIndex];
+			//for (int index = 0; index < set.Prefabs.Count; index++)
+			//{
+			//	PrefabEntry prefabEntry = set.Prefabs[index];
+			//	try
+			//	{
+			//		PrefabEntryGUI(prefabEntry);
+			//	}
+			//	catch (Exception exception)
+			//	{
+			//		Debug.LogError($"Failed rendering GUI for {set.Name}[{index}]");
+			//		Debug.LogException(exception, prefabEntry.Prefab);
+			//	}
+			//}
+
+			/*
+			AddButton("Normalize occurrence factors", () => set.Prefabs.Count > 0, () =>
+			{
+				float totalFactor = set.Prefabs.Sum(p => p.OccurrenceFactor);
+				foreach (PrefabEntry entry in set.Prefabs)
+				{
+					entry.OccurrenceFactor /= totalFactor;
+				}
+			});
+			//*/
+
+			using (new EditorGUILayout.HorizontalScope())
+			{
+				AddButton("-", () => Debug.LogWarning($"Remove of prefab not implemented yet"));
+				AddButton("+", () =>
+				{
+					prefabsProperty.InsertArrayElementAtIndex(prefabsProperty.arraySize);
+					//set.Prefabs.Add(new PrefabEntry());
+					OnSetChanged();
+				});
+			}
+		}
+	}
+
+	private void DrawBrushElements(SerializedProperty prefabsProperty)
+	{
+		if(prefabsProperty == null) throw new ArgumentNullException(nameof(prefabsProperty));
+		if(!prefabsProperty.isArray) throw new ArgumentException("Given property is not an array.", nameof(prefabsProperty));
+
+		if (prefabsProperty.arraySize == 0)
+		{
+			EditorGUILayout.LabelField("No elements in set.", ToolGui.Warning, GUILayout.ExpandWidth(true));
+		}
+		else
+		{
+			for (int idx = 0; idx < prefabsProperty.arraySize; idx++)
+			{
+				SerializedProperty elementProperty = prefabsProperty.GetArrayElementAtIndex(idx);
+				DrawBrushElement(elementProperty);
+			}
+		}
+	}
+
+	private void DrawBrushElement(SerializedProperty elementProperty)
+	{
+		using (new EditorGUILayout.HorizontalScope())
+		{
+			GameObject prefab = null;
+			using (new EditorGUILayout.VerticalScope())
+			{
+				// Prefab
+				SerializedProperty prefabProperty = elementProperty.FindPropertyRelative(nameof(PrefabEntry.Prefab));
+				prefab = (GameObject)prefabProperty.objectReferenceValue;
+				prefabProperty.objectReferenceValue = (GameObject)EditorGUILayout.ObjectField(new GUIContent("Prefab"), prefab, typeof(GameObject), false);
+
+				// Occurrence factor
+				SerializedProperty occurrenceFactorProperty = elementProperty.FindPropertyRelative(nameof(PrefabEntry.OccurrenceFactor));
+				float newOccurrenceFactor = EditorGUILayout.Slider("Occurrence factor", occurrenceFactorProperty.floatValue, 0f, 1f);
+				if (Math.Abs(occurrenceFactorProperty.floatValue - newOccurrenceFactor) > 0.00001)
+				{
+					occurrenceFactorProperty.floatValue = newOccurrenceFactor;
+					// TODO: Recalculate values.
+					//float totalFactor = _sets[_selectedSetIndex].Prefabs.Sum(p => p.OccurrenceFactor);
+					//foreach (PrefabEntry entry in _sets[_selectedSetIndex].Prefabs)
+					//{
+					//	entry.OccurrenceFactor /= totalFactor;
+					//}
+					OnSetChanged();
+				}
+			}
+
+			if (prefab)
+			{
+				Texture2D previewTexture = AssetPreview.GetAssetPreview(prefab);
+				GUIContent content = new GUIContent(previewTexture);
+				float size = content.image?.width ?? 0f; //  * 2.5f;
+				EditorGUILayout.LabelField("", GUILayout.Width(size), GUILayout.Height(size));
+				var rect = GUILayoutUtility.GetLastRect();
+				EditorGUI.DrawPreviewTexture(new Rect(rect.x, rect.y, size, size), previewTexture);
+			}
+		}
+	}
+
+	private bool DrawBrushSetDropdown()
+	{
+		// Here we add the index of the element in the label name, else items with no content are not shown or elements with the same name are only shown once.
+		string[] labels = _serializedPrefabSets.GetArrayValues(p => p.stringValue, nameof(PrefabSet.Name)).Select((label, idx) => $"{idx + 1}: {label}").ToArray();
+		int currentIndex = _serializedSelectedSetIndex.intValue;
+
+		int newSelectedIndex = EditorGUILayout.Popup("Brush set", currentIndex, labels);
+
+		if (newSelectedIndex != currentIndex)
+		{
+			_serializedSelectedSetIndex.intValue = newSelectedIndex;
+			OnActiveSetChanged(currentIndex, newSelectedIndex);
+			currentIndex = newSelectedIndex;
+		}
+
+		return currentIndex < labels.Length;
+	}
+
+	private void OnSetChanged()
+	{
+		foreach (PlacementLocation location in RandomLocations)
+		{
+			location.PrefabIndex = GetRandomPrefabIndex();
+		}
+	}
+
+	private void OnActiveSetChanged(int oldIndex, int newIndex)
+	{
+		PrefabSet set = _sets[newIndex];
+
+		if (set.Prefabs == null)
+		{
+			set.Prefabs = new List<PrefabEntry>();
+		}
+
+		if (set.Prefabs.Count == 0)
+		{
+			// Ensure there is always 1 element.
+			set.Prefabs.Add(new PrefabEntry());
+		}
+
+		OnSetChanged();
 	}
 
 	private void PrefabEntryGUI(PrefabEntry prefabEntry)
@@ -435,16 +823,18 @@ public class GrimmCannonWindow : EditorWindow
 		{
 			using (new EditorGUILayout.VerticalScope())
 			{
-				prefabEntry.Prefab = (GameObject) EditorGUILayout.ObjectField(new GUIContent("Prefab"), prefabEntry.Prefab, typeof(GameObject), false);
+				prefabEntry.Prefab = (GameObject)EditorGUILayout.ObjectField(new GUIContent("Prefab"), prefabEntry.Prefab, typeof(GameObject), false);
+
 				float newFactor = EditorGUILayout.Slider("OccurrenceFactor", prefabEntry.OccurrenceFactor, 0f, 1f);
 				if (Math.Abs(prefabEntry.OccurrenceFactor - newFactor) > 0.00001)
 				{
 					prefabEntry.OccurrenceFactor = newFactor;
-					float totalFactor = Sets[_selectedSetIndex].Prefabs.Sum(p => p.OccurrenceFactor);
-					foreach (PrefabEntry entry in Sets[_selectedSetIndex].Prefabs)
+					float totalFactor = _sets[_selectedSetIndex].Prefabs.Sum(p => p.OccurrenceFactor);
+					foreach (PrefabEntry entry in _sets[_selectedSetIndex].Prefabs)
 					{
 						entry.OccurrenceFactor /= totalFactor;
 					}
+					OnSetChanged();
 				}
 			}
 
@@ -468,6 +858,10 @@ public class GrimmCannonWindow : EditorWindow
 	public class PrefabSet
 	{
 		public string Name = "Unnamed";
+		public float NormalCorrectionMin = 0f;
+		public float NormalCorrectionMax = 0f;
+		public EaseType EaseMethod = EaseType.Linear;
+		// Note to self: DON'T USE 'IList'!
 		public List<PrefabEntry> Prefabs = new List<PrefabEntry>();
 	}
 
@@ -496,5 +890,24 @@ public class GrimmCannonWindow : EditorWindow
 
 			return isPressed;
 		}
+	}
+}
+
+public static class ToolGui
+{
+	public static GUIStyle Warning = CreateStyle(GUI.skin.label, TextAnchor.MiddleCenter, Color.red);
+
+	private static GUIStyle CreateStyle(GUIStyle baseStyle = null, TextAnchor alignment = TextAnchor.MiddleLeft, Color? foregroundColor = null)
+	{
+		GUIStyle style = baseStyle == null ? new GUIStyle() : new GUIStyle(GUI.skin.label);
+		
+		style.alignment = alignment;
+
+		if (foregroundColor.HasValue)
+		{
+			style.normal.textColor = foregroundColor.Value;
+		}
+
+		return style;
 	}
 }
